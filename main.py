@@ -392,6 +392,20 @@ def list_shipments(_: str = Depends(_get_current_user_email)) -> List[ShipmentRe
     return [_to_shipment_response(shipment) for shipment in shipments]
 
 
+@app.get("/api/shipments/{shipment_id}", response_model=ShipmentResponse)
+def get_shipment(
+    shipment_id: str,
+    _: str = Depends(_get_current_user_email),
+) -> ShipmentResponse:
+    shipment = _get_shipment_by_id(shipment_id)
+    if shipment is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Envío no encontrado",
+        )
+    return _to_shipment_response(shipment)
+
+
 @app.post("/api/shipments", response_model=ShipmentResponse, status_code=status.HTTP_201_CREATED)
 def create_shipment(
     payload: ShipmentCreate,
