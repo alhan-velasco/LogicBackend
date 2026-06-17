@@ -1,21 +1,27 @@
 """
 API RESTful de Logística - Envíos de Paquetes
-FastAPI - Listo para desplegar con: uvicorn main:app --reload --host 0.0.0.0 --port 8000
+FastAPI + SQLite - Listo para desplegar con:
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 """
 
 from __future__ import annotations
 
 import hashlib
 import secrets
+import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Generator, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
+
+DATABASE_PATH = Path(__file__).resolve().parent / "logistica.db"
 
 app = FastAPI(
     title="Logística API",
@@ -33,13 +39,62 @@ app.add_middleware(
 
 security = HTTPBearer(auto_error=False)
 
+
 # ---------------------------------------------------------------------------
-# Almacenamiento en memoria
+# Base de datos SQLite
 # ---------------------------------------------------------------------------
 
-users_db: Dict[str, dict] = {}
-tokens_db: Dict[str, str] = {}
-shipments_db: Dict[str, dict] = {}
+
+def init_db() -> None:
+    with get_db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                email TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                full_name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tokens (
+                token TEXT PRIMARY KEY,
+                user_email TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_email) REFERENCES users(email) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS shipments (
+                id TEXT PRIMARY KEY,
+                tracking_number TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                receiver TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+
+
+@contextmanager
+def get_db() -> Generator[sqlite3.Connection, None, None]:
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    init_db()
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +162,155 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _get_user_by_email(email: str) -> Optional[sqlite3.Row]:
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT email, password_hash, full_name FROM users WHERE email = ?",
+            (email,),
+        ).fetchone()
+
+
+def _create_user(email: str, password_hash: str, full_name: str) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (email, password_hash, full_name, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (email, password_hash, full_name, _now_iso()),
+        )
+
+
+def _create_token(token: str, user_email: str) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO tokens (token, user_email, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (token, user_email, _now_iso()),
+        )
+
+
+def _get_email_by_token(token: str) -> Optional[str]:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT user_email FROM tokens WHERE token = ?",
+            (token,),
+        ).fetchone()
+        return row["user_email"] if row else None
+
+
+def _row_to_shipment_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "trackingNumber": row["tracking_number"],
+        "sender": row["sender"],
+        "receiver": row["receiver"],
+        "destination": row["destination"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _get_shipment_by_id(shipment_id: str) -> Optional[dict]:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM shipments WHERE id = ?",
+            (shipment_id,),
+        ).fetchone()
+        return _row_to_shipment_dict(row) if row else None
+
+
+def _list_shipments() -> List[dict]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM shipments ORDER BY created_at DESC"
+        ).fetchall()
+        return [_row_to_shipment_dict(row) for row in rows]
+
+
+def _create_shipment_record(
+    shipment_id: str,
+    tracking_number: str,
+    sender: str,
+    receiver: str,
+    destination: str,
+    shipment_status: str,
+    created_at: str,
+    updated_at: str,
+) -> dict:
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO shipments (
+                id, tracking_number, sender, receiver, destination,
+                status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                shipment_id,
+                tracking_number,
+                sender,
+                receiver,
+                destination,
+                shipment_status,
+                created_at,
+                updated_at,
+            ),
+        )
+
+    return {
+        "id": shipment_id,
+        "trackingNumber": tracking_number,
+        "sender": sender,
+        "receiver": receiver,
+        "destination": destination,
+        "status": shipment_status,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def _update_shipment_record(
+    shipment_id: str,
+    destination: Optional[str],
+    shipment_status: Optional[str],
+) -> Optional[dict]:
+    shipment = _get_shipment_by_id(shipment_id)
+    if shipment is None:
+        return None
+
+    new_destination = destination if destination is not None else shipment["destination"]
+    new_status = shipment_status if shipment_status is not None else shipment["status"]
+    updated_at = _now_iso()
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE shipments
+            SET destination = ?, status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (new_destination, new_status, updated_at, shipment_id),
+        )
+
+    shipment["destination"] = new_destination
+    shipment["status"] = new_status
+    shipment["updated_at"] = updated_at
+    return shipment
+
+
+def _delete_shipment_record(shipment_id: str) -> bool:
+    with get_db() as conn:
+        cursor = conn.execute(
+            "DELETE FROM shipments WHERE id = ?",
+            (shipment_id,),
+        )
+        return cursor.rowcount > 0
+
+
 def _get_current_user_email(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> str:
@@ -115,7 +319,8 @@ def _get_current_user_email(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token de autenticación requerido",
         )
-    email = tokens_db.get(credentials.credentials)
+
+    email = _get_email_by_token(credentials.credentials)
     if email is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -135,20 +340,20 @@ def _to_shipment_response(data: dict) -> ShipmentResponse:
 
 @app.post("/api/auth/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest) -> AuthResponse:
-    if payload.email in users_db:
+    if _get_user_by_email(payload.email) is not None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="El correo electrónico ya está registrado",
         )
 
-    users_db[payload.email] = {
-        "email": payload.email,
-        "password_hash": _hash_password(payload.password),
-        "full_name": payload.full_name,
-    }
+    _create_user(
+        email=payload.email,
+        password_hash=_hash_password(payload.password),
+        full_name=payload.full_name,
+    )
 
     token = secrets.token_urlsafe(32)
-    tokens_db[token] = payload.email
+    _create_token(token, payload.email)
 
     return AuthResponse(
         token=token,
@@ -159,7 +364,7 @@ def register(payload: RegisterRequest) -> AuthResponse:
 
 @app.post("/api/auth/login", response_model=AuthResponse)
 def login(payload: LoginRequest) -> AuthResponse:
-    user = users_db.get(payload.email)
+    user = _get_user_by_email(payload.email)
     if user is None or user["password_hash"] != _hash_password(payload.password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -167,7 +372,7 @@ def login(payload: LoginRequest) -> AuthResponse:
         )
 
     token = secrets.token_urlsafe(32)
-    tokens_db[token] = payload.email
+    _create_token(token, payload.email)
 
     return AuthResponse(
         token=token,
@@ -183,12 +388,8 @@ def login(payload: LoginRequest) -> AuthResponse:
 
 @app.get("/api/shipments", response_model=List[ShipmentResponse])
 def list_shipments(_: str = Depends(_get_current_user_email)) -> List[ShipmentResponse]:
-    shipments = sorted(
-        shipments_db.values(),
-        key=lambda s: s["created_at"],
-        reverse=True,
-    )
-    return [_to_shipment_response(s) for s in shipments]
+    shipments = _list_shipments()
+    return [_to_shipment_response(shipment) for shipment in shipments]
 
 
 @app.post("/api/shipments", response_model=ShipmentResponse, status_code=status.HTTP_201_CREATED)
@@ -199,17 +400,16 @@ def create_shipment(
     shipment_id = str(uuid.uuid4())
     now = _now_iso()
 
-    shipment = {
-        "id": shipment_id,
-        "trackingNumber": payload.trackingNumber,
-        "sender": payload.sender,
-        "receiver": payload.receiver,
-        "destination": payload.destination,
-        "status": payload.status.value,
-        "created_at": now,
-        "updated_at": now,
-    }
-    shipments_db[shipment_id] = shipment
+    shipment = _create_shipment_record(
+        shipment_id=shipment_id,
+        tracking_number=payload.trackingNumber,
+        sender=payload.sender,
+        receiver=payload.receiver,
+        destination=payload.destination,
+        shipment_status=payload.status.value,
+        created_at=now,
+        updated_at=now,
+    )
     return _to_shipment_response(shipment)
 
 
@@ -219,36 +419,41 @@ def update_shipment(
     payload: ShipmentUpdate,
     _: str = Depends(_get_current_user_email),
 ) -> ShipmentResponse:
-    shipment = shipments_db.get(shipment_id)
+    shipment = _update_shipment_record(
+        shipment_id=shipment_id,
+        destination=payload.destination,
+        shipment_status=payload.status.value if payload.status is not None else None,
+    )
     if shipment is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Envío no encontrado",
         )
 
-    if payload.destination is not None:
-        shipment["destination"] = payload.destination
-    if payload.status is not None:
-        shipment["status"] = payload.status.value
-
-    shipment["updated_at"] = _now_iso()
-    shipments_db[shipment_id] = shipment
     return _to_shipment_response(shipment)
 
 
-@app.delete("/api/shipments/{shipment_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete(
+    "/api/shipments/{shipment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
 def delete_shipment(
     shipment_id: str,
     _: str = Depends(_get_current_user_email),
-) -> None:
-    if shipment_id not in shipments_db:
+) -> Response:
+    if not _delete_shipment_record(shipment_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Envío no encontrado",
         )
-    del shipments_db[shipment_id]
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/")
 def health_check() -> dict:
-    return {"status": "ok", "service": "logistica-api"}
+    return {
+        "status": "ok",
+        "service": "logistica-api",
+        "database": str(DATABASE_PATH.name),
+    }
